@@ -74,7 +74,8 @@ small{color:var(--mute);font-size:13px;overflow:hidden;text-overflow:ellipsis;wh
 .camera video{width:100%;height:100%;object-fit:cover;display:block}
 .frame{position:absolute;inset:25% 8%;border:3px solid rgba(255,255,255,.85);border-radius:12px;box-shadow:0 0 0 999px rgba(0,0,0,.35);pointer-events:none}
 .frame::after{content:"";position:absolute;left:6%;right:6%;top:50%;height:2px;background:#ff3b30}
-#torch{position:absolute;right:10px;bottom:10px;width:44px;height:44px;border-radius:50%;border:0;background:rgba(0,0,0,.55);font-size:20px}
+#torch,#zoomBtn{position:absolute;bottom:10px;min-width:44px;height:44px;border-radius:22px;border:0;background:rgba(0,0,0,.6);color:#fff;font-size:18px;font-weight:700;padding:0 12px}
+#torch{right:10px}#zoomBtn{left:10px}
 .row-form{display:flex;gap:8px;margin-top:12px}.row-form input{margin:0;flex:1}
 #stars{display:flex;gap:6px;margin-top:4px}
 #stars button{width:48px;height:48px;border-radius:12px;border:1px solid var(--line);background:var(--card);font-size:26px;color:var(--mute);cursor:pointer}
@@ -127,10 +128,14 @@ details{margin-top:10px}summary{cursor:pointer;color:var(--accent);font-weight:6
   <div class="camera">
     <video id="video" playsinline muted autoplay></video>
     <div class="frame"></div>
+    <button id="zoomBtn" hidden aria-label="Inzoomen">2×</button>
     <button id="torch" hidden aria-label="Zaklamp">🔦</button>
   </div>
   <div id="scanMsg" class="status"></div>
+  <div id="scanInfo" class="note"></div>
   <div id="scanActions"></div>
+  <button id="photoBtn" class="btn wide" type="button">📷&nbsp; Foto van barcode nemen</button>
+  <input id="photoInput" type="file" accept="image/*" capture="environment" hidden>
   <form id="manualBc" class="row-form">
     <input id="manualCode" inputmode="numeric" pattern="[0-9 ]*" placeholder="Of typ de barcode" autocomplete="off">
     <button class="btn" type="submit">Zoek</button>
@@ -233,7 +238,7 @@ details{margin-top:10px}summary{cursor:pointer;color:var(--accent);font-weight:6
 <div id="busy" hidden><span id="busyMsg">Even geduld…</span></div>
 <div id="toast" hidden></div>
 
-<script src="zxing.min.js"></script>
+<script src="zbar.min.js"></script>
 <script>
 'use strict';
 /* ====================================================================
@@ -263,7 +268,7 @@ const S = {
   view: 'home', form: null, detailId: null, saving: false, clearSearch: false,
   list: { q: '', sort: 'artist', genre: '', format: '', minRating: 0, check: false, limit: 100 },
   pumping: false, failed: null, retryTimer: null,
-  searchSeq: 0, searchResults: [], scanToken: 0, scanBusy: false, lookupToken: 0, reader: null, sheetUrl: ''
+  searchSeq: 0, searchResults: [], scanToken: 0, scanBusy: false, lookupToken: 0, stream: null, track: null, sheetUrl: ''
 };
 
 /* ---------- Normalisatie en duplicaatdetectie ---------- */
@@ -464,54 +469,165 @@ ENTER.home = () => {
 };
 
 /* ---------- Scannen ---------- */
+/* Live: de ingebouwde BarcodeDetector van de telefoon (Android/Chrome) als die er is, anders zbar (WebAssembly).
+   Foto: een foto van de eigen camera-app heeft veel meer pixels en een betere scherpstelling dan een videoframe. */
+const BC_FORMATS = ['ean_13', 'ean_8', 'upc_a', 'upc_e'];
+const ZBAR_OK = /EAN13|EAN8|UPCA|UPCE/i;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+let nativeDetector; // undefined = nog niet bepaald, null = niet beschikbaar
+async function getNative() {
+  if (nativeDetector !== undefined) return nativeDetector;
+  nativeDetector = null;
+  try {
+    if ('BarcodeDetector' in window) {
+      const f = await window.BarcodeDetector.getSupportedFormats();
+      const use = BC_FORMATS.filter(x => f.includes(x));
+      if (use.includes('ean_13')) nativeDetector = new window.BarcodeDetector({ formats: use });
+    }
+  } catch (e) { nativeDetector = null; }
+  return nativeDetector;
+}
+function zbarCodes(syms) { return (syms || []).filter(x => ZBAR_OK.test(String(x.typeName))).map(x => String(x.decode())).filter(t => /^\d{7,14}$/.test(t)); }
+
 function setScanMsg(t, k) { setMsg('scanMsg', t, k); }
 function stopCamera() {
-  try { if (S.reader) S.reader.reset(); } catch (e) { /* al gestopt */ }
-  S.reader = null; $('#torch').hidden = true;
+  S.scanToken++;
+  try { if (S.stream) S.stream.getTracks().forEach(t => t.stop()); } catch (e) { /* al gestopt */ }
+  S.stream = null; S.track = null;
+  try { $('#video').srcObject = null; } catch (e) { /* geen video */ }
+  $('#torch').hidden = true; $('#zoomBtn').hidden = true;
 }
-function stopScan() { S.scanToken++; stopCamera(); }
-function startScan() {
+function stopScan() { stopCamera(); }
+
+async function startScan() {
   initAudio();
   stopCamera();
   S.scanBusy = false; S.lookupToken++;
-  $('#scanResults').innerHTML = ''; $('#scanActions').innerHTML = '';
-  if (!window.ZXing) { setScanMsg('De scanner kon niet laden. Typ de barcode hieronder.', 'err'); return; }
+  $('#scanResults').innerHTML = ''; $('#scanActions').innerHTML = ''; $('#scanInfo').textContent = '';
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    setScanMsg('Deze browser geeft geen toegang tot de camera. Typ de barcode hieronder.', 'err'); return;
+    setScanMsg('Deze browser geeft geen toegang tot de camera. Gebruik "Foto van barcode nemen" of typ de barcode hieronder.', 'err'); return;
   }
+  const token = S.scanToken;
   setScanMsg('Camera starten…', 'busy');
-  const hints = new Map();
-  hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [ZXing.BarcodeFormat.EAN_13, ZXing.BarcodeFormat.UPC_A, ZXing.BarcodeFormat.EAN_8, ZXing.BarcodeFormat.UPC_E]);
-  hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
-  const reader = new ZXing.BrowserMultiFormatReader(hints, 200);
-  S.reader = reader;
-  const token = ++S.scanToken;
-  reader.decodeFromConstraints(
-    { audio: false, video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } } },
-    $('#video'),
-    (result) => { if (result && token === S.scanToken && !S.scanBusy) { S.scanBusy = true; beep(); handleBarcode(result.getText()); } }
-  ).then(() => {
-    if (token !== S.scanToken) return;
-    setScanMsg('Houd de barcode in het kader, ongeveer 15–20 cm van de camera.');
-    setupTorch();
-  }).catch(e => {
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } } });
+  } catch (e) {
     if (token !== S.scanToken) return;
     const n = e && e.name;
-    setScanMsg(n === 'NotAllowedError' ? 'Geen toegang tot de camera. Sta de camera toe voor deze app in de instellingen van je telefoon, of typ de barcode.'
+    setScanMsg(n === 'NotAllowedError' ? 'Geen toegang tot de camera. Sta de camera toe voor deze app in de instellingen van je telefoon, of gebruik "Foto van barcode nemen".'
       : n === 'NotFoundError' ? 'Geen camera gevonden. Typ de barcode hieronder.'
-      : 'De camera kon niet starten (' + (e && e.message || n) + '). Typ de barcode hieronder.', 'err');
-  });
+      : 'De camera kon niet starten (' + (e && e.message || n) + '). Gebruik "Foto van barcode nemen" of typ de barcode.', 'err');
+    return;
+  }
+  if (token !== S.scanToken) { stream.getTracks().forEach(t => t.stop()); return; }
+  S.stream = stream;
+  const video = $('#video');
+  video.srcObject = stream;
+  try { await video.play(); } catch (e) { /* autoplay kan geblokkeerd zijn; frames komen dan alsnog */ }
+  const native = await getNative();
+  if (token !== S.scanToken) return;
+  if (!native && !window.zbarWasm) { setScanMsg('De scanner kon niet laden. Gebruik "Foto van barcode nemen" of typ de barcode.', 'err'); return; }
+  setupCameraControls(stream);
+  setScanMsg('Vul het kader met de streepjescode (20–25 cm afstand). Lukt dat niet? Gebruik "Foto van barcode nemen".');
+  liveLoop(token, native, video);
 }
-function setupTorch() {
+
+function setupCameraControls(stream) {
+  const track = stream.getVideoTracks()[0]; S.track = track;
+  if (!track) return;
+  let caps = {};
+  try { caps = track.getCapabilities ? track.getCapabilities() : {}; } catch (e) { caps = {}; }
+  try { if (caps.focusMode && caps.focusMode.includes('continuous')) track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] }).catch(() => {}); } catch (e) { /* optioneel */ }
+  const zb = $('#zoomBtn');
+  if (caps.zoom && caps.zoom.max > 1) {
+    // Een CD-barcode is klein: 2× inzoomen geeft meer pixels per streepje bij dezelfde afstand.
+    const levels = [1, 2, 3].filter(z => z >= (caps.zoom.min || 1) && z <= caps.zoom.max);
+    let i = Math.min(1, levels.length - 1);
+    const apply = () => { track.applyConstraints({ advanced: [{ zoom: levels[i] }] }).catch(() => {}); zb.textContent = levels[i] + '×'; };
+    zb.hidden = false; apply(); zb.onclick = () => { i = (i + 1) % levels.length; apply(); };
+  }
+  if (caps.torch) { const b = $('#torch'); b.hidden = false; let on = false; b.onclick = () => { on = !on; track.applyConstraints({ advanced: [{ torch: on }] }).catch(() => {}); }; }
+}
+
+async function liveLoop(token, native, video) {
+  const cv = document.createElement('canvas');
+  const ctx = cv.getContext('2d', { willReadFrequently: true });
+  let frames = 0, lastCode = '', lastAt = 0;
+  while (token === S.scanToken) {
+    if (!S.scanBusy && video.readyState >= 2 && video.videoWidth) {
+      let code = '';
+      try {
+        if (native) {
+          const r = await native.detect(video);
+          if (r && r.length) code = String(r[0].rawValue || '');
+        } else {
+          const vw = video.videoWidth, vh = video.videoHeight;
+          const sx = Math.round(vw * 0.04), sy = Math.round(vh * 0.18), sw = Math.round(vw * 0.92), sh = Math.round(vh * 0.64);
+          cv.width = sw; cv.height = sh;
+          ctx.drawImage(video, sx, sy, sw, sh, 0, 0, sw, sh);
+          code = zbarCodes(await window.zbarWasm.scanImageData(ctx.getImageData(0, 0, sw, sh)))[0] || '';
+        }
+      } catch (e) { /* dit frame overslaan */ }
+      frames++;
+      if (frames % 4 === 0 && token === S.scanToken) {
+        const z = $('#zoomBtn').hidden ? '' : ' · zoom ' + $('#zoomBtn').textContent;
+        $('#scanInfo').textContent = (native ? 'Scanner: ingebouwd' : 'Scanner: zbar') + ' · beeld ' + video.videoWidth + '×' + video.videoHeight + z + ' · ' + frames + ' beelden bekeken';
+      }
+      if (code && /^\d{7,14}$/.test(code)) {
+        const now = Date.now();
+        // De ingebouwde detector is betrouwbaar genoeg voor één lezing; bij zbar eisen we twee dezelfde lezingen kort na elkaar.
+        if (native || (code === lastCode && now - lastAt < 2500)) { S.scanBusy = true; beep(); handleBarcode(code); return; }
+        lastCode = code; lastAt = now;
+      }
+    }
+    await sleep(native ? 100 : 40);
+  }
+}
+
+async function decodePhoto(file) {
+  const url = URL.createObjectURL(file);
   try {
-    const stream = $('#video').srcObject; const track = stream && stream.getVideoTracks()[0];
-    if (!track) return;
-    const caps = track.getCapabilities ? track.getCapabilities() : {};
-    if (caps.focusMode && caps.focusMode.includes('continuous')) track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] }).catch(() => {});
-    if (caps.torch) { const b = $('#torch'); b.hidden = false; let on = false; b.onclick = () => { on = !on; track.applyConstraints({ advanced: [{ torch: on }] }).catch(() => {}); }; }
-  } catch (e) { /* optioneel */ }
+    const img = new Image(); img.src = url;
+    await img.decode();
+    const native = await getNative();
+    if (native) { try { const r = await native.detect(img); if (r && r.length && /^\d{7,14}$/.test(String(r[0].rawValue))) return String(r[0].rawValue); } catch (e) { /* door met zbar */ } }
+    if (!window.zbarWasm) return null;
+    let w = img.naturalWidth, h = img.naturalHeight;
+    const cap = Math.min(1, 4096 / Math.max(w, h), Math.sqrt(16e6 / (w * h)));
+    const base = cap;
+    const scales = Math.max(w, h) * base > 1500 ? [base, base * 0.5, base * 0.33] : [base];
+    for (const sc of scales) {
+      const cw = Math.max(1, Math.round(w * sc)), ch = Math.max(1, Math.round(h * sc));
+      const cv = document.createElement('canvas'); cv.width = cw; cv.height = ch;
+      const ctx = cv.getContext('2d', { willReadFrequently: true });
+      ctx.imageSmoothingQuality = 'high'; ctx.drawImage(img, 0, 0, cw, ch);
+      const code = zbarCodes(await window.zbarWasm.scanImageData(ctx.getImageData(0, 0, cw, ch)))[0];
+      if (code) return code;
+    }
+    return null;
+  } finally { URL.revokeObjectURL(url); }
 }
-ENTER.scan = () => startScan();
+$('#photoBtn').addEventListener('click', () => {
+  initAudio();
+  stopCamera(); S.scanBusy = true;   // de camera-app neemt het over; daarna kun je opnieuw scannen
+  setScanMsg('Maak een foto van de barcode: houd de telefoon recht erboven, zo dichtbij dat de barcode scherp blijft.');
+  scanButtons({ again: true });
+  $('#photoInput').click();
+});
+$('#photoInput').addEventListener('change', async e => {
+  const f = e.target.files && e.target.files[0]; e.target.value = '';
+  if (!f) return;
+  S.scanBusy = true; stopCamera();
+  $('#scanResults').innerHTML = ''; $('#scanActions').innerHTML = '';
+  setScanMsg('Foto wordt gelezen…', 'busy');
+  let code = null;
+  try { code = await decodePhoto(f); } catch (err) { code = null; }
+  if (S.view !== 'scan') return;
+  if (code) { beep(); handleBarcode(code); }
+  else { setScanMsg('Geen barcode gevonden op de foto. Probeer het scherper en dichterbij, met genoeg licht, of typ de cijfers hieronder.', 'err'); scanButtons({ again: true }); }
+});
+ENTER.scan = () => { startScan(); };
 
 async function handleBarcode(code) {
   stopCamera();
