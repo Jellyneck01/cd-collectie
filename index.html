@@ -246,7 +246,7 @@ details{margin-top:10px}summary{cursor:pointer;color:var(--accent);font-weight:6
    app praat via het Apps Script. Wijzigingen worden eerst lokaal getoond
    en op de achtergrond opgeslagen (wachtrij), zodat scannen snel blijft.
    ==================================================================== */
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.0.1';
 const KEYS = ['nr','barcode','artist','title','label','songs','rating','comments','year','genre','format','edition','country','check','added','source','id'];
 const EDITABLE = ['barcode','artist','title','label','songs','rating','comments','year','genre','format','edition','country','check'];
 const VIEWS = ['home','scan','search','form','list','detail','settings'];
@@ -887,7 +887,8 @@ $('#delBtn').addEventListener('click', () => {
 const URL_OK = u => /^https:\/\/script\.google\.com\//.test(u);
 function refreshSettingsInfo() {
   $('#aboutInfo').textContent = 'App-versie ' + APP_VERSION + ' · ' + nlNum(S.cds.length) + " CD's geladen";
-  const a = $('#sheetLink'); a.hidden = !S.sheetUrl; if (S.sheetUrl) a.href = S.sheetUrl;
+  const ok = /^https:\/\/docs\.google\.com\/spreadsheets\//.test(S.sheetUrl || '');
+  const a = $('#sheetLink'); a.hidden = !ok; if (ok) a.href = S.sheetUrl;
 }
 ENTER.settings = () => {
   $('#cfgUrl').value = S.cfg.url; $('#cfgKey').value = S.cfg.key; setMsg('cfgMsg', '');
@@ -914,9 +915,13 @@ function decodeCfg(token) {
   try { const o = JSON.parse(decodeURIComponent(atob(decodeURIComponent(token)))); return (URL_OK(o.u) && o.k) ? { url: o.u, key: o.k } : null; }
   catch (e) { return null; }
 }
-function adoptCfg(c) {
+function adoptCfg(c, fromLink) {
   const changed = S.cfg.url && (S.cfg.url !== c.url || S.cfg.key !== c.key);
-  if (changed && !confirm('De verbinding met het Sheet wijzigen naar het adres uit deze link?')) return false;
+  if (!changed && S.cfg.url) return true;   // al zo ingesteld
+  const id = (c.url.match(/\/s\/([^/]+)/) || [])[1] || '';
+  const ask = (changed ? 'De verbinding met het Sheet wijzigen naar het adres uit deze link?' : 'Deze link stelt de CD-app in.') +
+    '\n\nAlleen doorgaan als je de link zelf hebt gemaakt of hebt gekregen van iemand die je vertrouwt.' + (id ? '\n\n(script …' + id.slice(-6) + ')' : '');
+  if ((changed || fromLink) && !confirm(ask)) return false;
   S.cfg = c; store.set('cfg', c); return true;
 }
 $('#cfgPasteBtn').addEventListener('click', () => {
@@ -942,7 +947,7 @@ function readHashConfig() {
   history.replaceState(null, '', location.pathname + location.search);
   const c = decodeCfg(m[1]);
   if (!c) { toast('Deze configuratielink is ongeldig.', 'err'); return; }
-  if (adoptCfg(c)) toast('Verbinding ingesteld');
+  if (adoptCfg(c, true)) toast('Verbinding ingesteld');
 }
 
 /* ---------- Opstarten ---------- */
